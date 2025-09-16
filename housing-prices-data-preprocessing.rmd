@@ -1,0 +1,317 @@
+---
+title: "Preprocessing Housing Prices Data"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+add_optional_features <- TRUE
+```
+
+## Importing Dependencies
+
+We will use jsonlite to read the preprocessed data information, data.table to read the CSVs shared with us, stringr for string extraction, DataExplorer for visualization, and finally tidyr for encoding.
+
+```{r dependencies, echo=TRUE}
+library(jsonlite)
+library(data.table)
+library(stringr)
+library(DataExplorer)
+library(caret)
+```
+
+## Loading data and preparing environment
+
+Loading both train and test datasets with fread. Loading the preprocessing data with fromJSON.
+We plot the first overview over the data contained in train.csv and test.csv.
+
+```{r loading, echo=TRUE}
+train_table <- data.table::fread("/kaggle/input/home-data-for-ml-course/train.csv", index = "Id")
+test_table <- data.table::fread("/kaggle/input/home-data-for-ml-course/test.csv", index = "Id")
+
+preprocessing_list <-
+  fromJSON("/kaggle/input/housing-data-preprocessed-data/HousingPricesPreprocessing.json")
+
+plot_intro(train_table, title = "Training Data")
+plot_intro(test_table, title = "Test Data")
+```
+
+As there are some mismatches between the data description and data provided in the competition, 
+we will replace some of the variant entries with best guesses based on the provided data description.
+
+```{r fixing_data_errors, echo=TRUE}
+
+error_list <- list(
+  Neighborhood = list(NAmes = "Names"),
+  MSZoning = list("C (all)" = "C"),
+  BldgType = list("2fmCon" = "2FmCon", Duplex = "Duplx", Twnhs = "TwnhsI"),
+  Exterior2nd = list(
+    "Wd Shng" = "WdShing", CmentBd = "CemntBd", "Brk Cmn" = "BrkComm"
+  )
+)
+
+replace_values_in_col <- function(col, value_to_replace, replacement_value) {
+  col[col == value_to_replace] <- replacement_value
+  col
+}
+
+fix_errors <- function(input_table) {
+  output_table <- copy(input_table)
+
+  for (error_col in names(error_list)) {
+    col_errors <- error_list[[error_col]]
+    for (error_value in names(col_errors)) {
+      replacement_value <- col_errors[[error_value]]
+      output_table[[error_col]] <-
+        replace_values_in_col(
+          output_table[[error_col]],
+          error_value, replacement_value
+        )
+    }
+  }
+  output_table[is.na(output_table[["MasVnrType"]]), "MasVnrType"] <- "None"
+  output_table
+}
+
+train_table <- fix_errors(train_table)
+test_table <- fix_errors(test_table)
+```
+
+The general data features that we parsed from the data_description.txt can now be collected 
+before we continue to the actual preprocessing.
+
+```{r parsing_preprocessing_list, echo=TRUE}
+factor_cols <- character()
+na_is_factor_cols <- character()
+ordered_cols <- character()
+for (name in names(preprocessing_list)) {
+  if (preprocessing_list[[name]]$factor == TRUE) {
+    factor_cols <- c(factor_cols, name)
+  }
+  if (preprocessing_list[[name]]$na_is_factor == TRUE) {
+    na_is_factor_cols <- c(na_is_factor_cols, name)
+  }
+  if (preprocessing_list[[name]]$ordered == TRUE) {
+    ordered_cols <- c(ordered_cols, name)
+  }
+}
+```
+
+We can extract further features from some of the columns in the data, for example separate entries for 
+"Privacy" and "Wood" based on the "Fence" column.
+
+```{r optional_feature_extraction, echo=TRUE}
+if (add_optional_features) {
+  regex_feature_extraction <-
+    list(
+      Fence = list(
+        Privacy = "(\\w+)(?=Prv)",
+        Wood = "(\\w+)(?=W[ow])"
+      ),
+      HouseStyle = list(
+        Stories = "[\\d\\.]+",
+        SecondLevelFinished = "Fin|Unf"
+      )
+    )
+
+  extract_additional_features <- function(input_table) {
+    output_table <- input_table
+
+    for (col in names(regex_feature_extraction)) {
+      regex_list <- regex_feature_extraction[[col]]
+      for (out_col in names(regex_list)) {
+        output_table[[out_col]] <-
+          str_extract(output_table[[col]], regex_list[[out_col]])
+      }
+    }
+    output_table[, Stories := as.numeric(Stories)]
+
+    output_table[, ZoneIsResidential := as.integer(
+      MSZoning %like% "R" | MSZoning == "FV"
+    )]
+
+    output_table[, LandNotLevel := as.integer(!LandContour == "Lvl")]
+
+    output_table[, NearPositiveFeature := as.integer(
+      Condition1 %like% "Pos" | Condition2 == "Pos"
+    )]
+
+    output_table[, NearRailRoad := as.integer(
+      Condition1 %like% "RR" | Condition2 == "RR"
+    )]
+
+    output_table[, NearStreet := as.integer(
+      Condition1 %in% c("Artery", "Feedr") |
+        Condition2 %in% c("Artery", "Feedr")
+    )]
+
+    output_table[, IsTownHouse := as.integer(
+      BldgType %in% c("TwnhsE", "TwnhsI")
+    )]
+    output_table[, IsSplit := as.integer(
+      HouseStyle %in% c("SFoyer", "SLvl")
+    )]
+
+    output_table[, Age := YrSold - YearBuilt]
+    output_table[, YearsSinceRemodel := YrSold - YearRemodAdd]
+
+    output_table[, HasGarage := as.integer(!is.na(GarageType))]
+    output_table[, HasPool := as.integer(!is.na(PoolQC))]
+    output_table[, HasFence := as.integer(!is.na(Fence))]
+
+    output_table[, ContractSale := as.integer(
+      SaleType %in% c("Con", "ConLw", "ConLI", "ConLD")
+    )]
+    output_table[, WarrantyDeed := as.integer(
+      SaleType %in% c("WD", "CWD", "VWD")
+    )]
+    output_table
+  }
+
+  ordered_cols <- c(ordered_cols, c("Privacy", "Wood", "SecondLevelFinished"))
+  na_is_factor_cols <- c(
+    na_is_factor_cols, c("Privacy", "Wood", "SecondLevelFinished")
+  )
+
+  preprocessing_list$Privacy <- list(
+    discrete_values = c("Gd", "Mn", "NA"),
+    factor = TRUE,
+    na_is_factor = TRUE,
+    ordered = TRUE
+  )
+  preprocessing_list$Wood <- list(
+    discrete_values = c("Gd", "Mn", "NA"),
+    factor = TRUE,
+    na_is_factor = TRUE,
+    ordered = TRUE
+  )
+  preprocessing_list$SecondLevelFinished <- list(
+    discrete_values = c("Fin", "Unf", "NA"),
+    factor = TRUE,
+    na_is_factor = TRUE,
+    ordered = TRUE
+  )
+
+  train_table <- extract_additional_features(train_table)
+  test_table <- extract_additional_features(test_table)
+
+  plot_intro(train_table, title = "Training Data")
+  plot_intro(test_table, title = "Test Data")
+}
+
+```
+
+Now we can use the information we parsed from the data_description.txt to apply clean structures
+to the textual data in preparation for the encoding applied in the next step.
+
+```{r applying_preprocessing_list, echo=TRUE}
+apply_preprocessing <- function(input_table) {
+  output_table <- input_table
+  for (col in names(output_table)) {
+    if (col %in% na_is_factor_cols) {
+      output_table[is.na(output_table[[col]]), col] <- "NA"
+    }
+
+    if (col %in% ordered_cols) {
+      output_table[[col]] <- ordered(output_table[[col]],
+        levels = preprocessing_list[[col]]$discrete_values
+      )
+    } else if (col %in% factor_cols) {
+      output_table[[col]] <- factor(output_table[[col]],
+        levels = preprocessing_list[[col]]$discrete_values
+      )
+    }
+
+    values_to_drop <- preprocessing_list[[col]]$values_to_drop
+    if (length(values_to_drop) != 0) {
+      for (value_to_drop in values_to_drop) {
+        output_table[output_table[[col]] == value_to_drop, col] <- NA
+      }
+    }
+  }
+  output_table
+}
+
+preprocessed_train_table <- apply_preprocessing(train_table)
+preprocessed_test_table <- apply_preprocessing(test_table)
+
+plot_intro(preprocessed_train_table, title = "Training Data")
+plot_intro(preprocessed_test_table, title = "Test Data")
+plot_bar(preprocessed_train_table, title = "Preprocessed Training Data")
+plot_bar(preprocessed_test_table, title = "Preprocessed Test Data")
+```
+
+We store the preprocessed data for later exploration.
+
+```{r storing_preprocessed_data, echo=FALSE}
+write.csv(
+  preprocessed_train_table,
+  file = "/kaggle/working/preprocessed_train.csv", row.names = FALSE
+)
+write.csv(
+  preprocessed_test_table,
+  file = "/kaggle/working/preprocessed_test.csv", row.names = FALSE
+)
+```
+
+Now we can encode the features we prepared into purely numerical columns, to make the data compatible
+with most models.
+
+```{r encoding_features, echo=FALSE}
+
+encode_features <- function(input_table) {
+  output_table <- input_table
+
+  col_is_factor <- sapply(output_table, is.factor)
+  col_is_ordered <- sapply(output_table, is.ordered)
+
+  # ordered is a subclass of factor, but we will need to treat both separately
+  col_is_factor <- col_is_factor & !col_is_ordered
+
+  # Encoding ordered cols with label encoding, thanks to the levels we provided
+  # earlier we can be sure that cols with missing factors are still encoded the
+  # same way
+  ordered_cols <- names(output_table)[col_is_ordered]
+  for (ordered_col in ordered_cols) {
+    output_table[[ordered_col]] <-
+      as.integer(output_table[[ordered_col]])
+  }
+
+  factor_cols <- names(output_table)[col_is_factor]
+  level_total = 0
+  for (col in factor_cols) {
+    level_total <- level_total + length(levels(output_table[[col]]))
+  }
+
+  formula_string <- paste(factor_cols, collapse = " + ")
+  one_hot_formula <- as.formula(paste("~", formula_string, " - 1"))
+
+  dummy_vars <- dummyVars(one_hot_formula, data = output_table)
+  one_hot_table <- data.frame(predict(dummy_vars,
+    newdata = output_table
+  ))
+
+  output_table <- cbind(
+    output_table[, -..factor_cols], one_hot_table
+  )
+  output_table
+}
+
+encoded_train_table <- encode_features(preprocessed_train_table)
+encoded_test_table <- encode_features(preprocessed_test_table)
+
+plot_intro(encoded_train_table, title = "Encoded Training Data")
+plot_intro(encoded_test_table, title = "Encoded Test Data")
+```
+
+The encoded data is again stored as CSVs.
+
+```{r storing_encoded_data, echo=FALSE}
+write.csv(
+  encoded_train_table,
+  file = "/kaggle/working/encoded_train.csv", row.names = FALSE
+)
+write.csv(
+  encoded_test_table,
+  file = "/kaggle/working/encoded_test.csv", row.names = FALSE
+)
+```
